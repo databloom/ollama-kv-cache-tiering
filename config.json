@@ -1,0 +1,45 @@
+{
+  "server": {
+    "listen": "0.0.0.0:8080",
+    "max_concurrent_requests": 4,
+    "request_timeout_secs": 300
+  },
+  "model": {
+    "model_path": "model.gguf",
+    "n_gpu_layers": -1,
+    "context_size": 131072,
+    "n_heads": 40,
+    "n_kv_heads": 8,
+    "head_dim": 128,
+    "n_layers": 48,
+    "block_size": 256
+  },
+  "tiers": {
+    "gpu_vram_budget": 7516192768,
+    "host_ram_budget": 8589934592,
+    "local_ssd_path": "/tmp/kv-cache",
+    "local_ssd_budget": 21474836480,
+    "nfs_path": "/mnt/kv-cache",
+    "nfs_budget": 6413846118400,
+    "high_watermark": 0.85,
+    "low_watermark": 0.70
+  },
+  "eviction": {
+    "alpha": 0.6,
+    "beta": 0.3,
+    "gamma": 0.1,
+    "attention_ema_decay": 0.9,
+    "min_hot_blocks": 8
+  },
+  "compression": {
+    "gpu_to_ram_quantize": true,
+    "ram_to_disk_quantize": true,
+    "disk_zstd_compression": true,
+    "zstd_level": 3
+  },
+  "prefetch": {
+    "hot_window_tokens": 2048,
+    "prefetch_ahead": 4,
+    "attention_based": false
+  }
+}

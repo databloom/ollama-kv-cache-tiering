@@ -1,0 +1,14 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.o
+*.so
+*.dylib
+
+# KV cache data
+/tmp/kv-cache/
+*.kvblock
