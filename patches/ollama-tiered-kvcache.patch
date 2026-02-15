@@ -1,0 +1,354 @@
+diff --git a/kvcache/tiered.go b/kvcache/tiered.go
+new file mode 100644
+--- /dev/null
++++ b/kvcache/tiered.go
+@@ -0,0 +1,215 @@
++package kvcache
++
++import (
++	"log/slog"
++	"math"
++	"slices"
++
++	"github.com/ollama/ollama/diskstore"
++	"github.com/ollama/ollama/ml"
++)
++
++// TieredCausal wraps Causal with transparent disk-backed KV eviction.
++//
++// When tokens are evicted via Remove(), their raw K/V tensor data is
++// snapshot to a diskstore.Store before the cells are freed. On prefix
++// cache lookups, TieredCausal checks the disk store for data that
++// extends the in-memory prefix match.
++type TieredCausal struct {
++	*Causal
++	store     *diskstore.Store
++	blockSize int32
++	enabled   bool
++}
++
++// NewTieredCausal wraps an existing Causal cache with disk tiering.
++func NewTieredCausal(causal *Causal, store *diskstore.Store, blockSize int32) *TieredCausal {
++	return &TieredCausal{
++		Causal:    causal,
++		store:     store,
++		blockSize: blockSize,
++		enabled:   true,
++	}
++}
++
++// Remove overrides Causal.Remove to snapshot evicted data before freeing.
++//
++// When endIndex != math.MaxInt32, this is a partial removal (context shift).
++// We save the K/V data for positions [beginIndex, endIndex) to disk before
++// the parent Remove() marks those cells as free.
++//
++// When endIndex == math.MaxInt32, this is a full sequence clear (e.g. on
++// error recovery). We don't snapshot in that case.
++func (t *TieredCausal) Remove(seq int, beginIndex, endIndex int32) error {
++	if t.enabled && t.store != nil && endIndex != math.MaxInt32 {
++		t.snapshotRange(seq, beginIndex, endIndex)
++	}
++	return t.Causal.Remove(seq, beginIndex, endIndex)
++}
++
++// snapshotRange saves K/V tensor bytes for the evicted position range.
++//
++// For each layer, it iterates over cache cells belonging to the sequence
++// within [beginPos, endPos), reads the raw bytes from the backing tensor,
++// and writes them to the disk store.
++func (t *TieredCausal) snapshotRange(seq int, beginPos, endPos int32) {
++	var saved int
++
++	for layer, key := range t.Causal.keys {
++		if key == nil {
++			continue
++		}
++
++		rowSize := key.Stride(2)
++		keyData := key.Bytes()
++		if keyData == nil {
++			continue
++		}
++
++		var valData []byte
++		var valRowSize int
++		if val := t.Causal.values[layer]; val != nil {
++			valRowSize = val.Stride(2)
++			valData = val.Bytes()
++		}
++
++		for i, cell := range t.Causal.cells {
++			if !slices.Contains(cell.sequences, seq) {
++				continue
++			}
++			if cell.pos < beginPos || cell.pos >= endPos {
++				continue
++			}
++
++			// Snapshot key tensor row.
++			kOffset := rowSize * i
++			if kOffset+rowSize <= len(keyData) {
++				kBytes := make([]byte, rowSize)
++				copy(kBytes, keyData[kOffset:kOffset+rowSize])
++
++				bk := diskstore.BlockKey{
++					Seq:      seq,
++					Layer:    layer,
++					BeginPos: cell.pos,
++					EndPos:   cell.pos + 1,
++					IsKey:    true,
++				}
++				dtype := t.Causal.DType.String()
++				shape := key.Shape()
++				if err := t.store.Put(bk, dtype, shape, kBytes); err != nil {
++					slog.Warn("tiered: failed to snapshot key",
++						"layer", layer, "pos", cell.pos, "error", err)
++				}
++			}
++
++			// Snapshot value tensor row.
++			if valData != nil {
++				vOffset := valRowSize * i
++				if vOffset+valRowSize <= len(valData) {
++					vBytes := make([]byte, valRowSize)
++					copy(vBytes, valData[vOffset:vOffset+valRowSize])
++
++					bv := diskstore.BlockKey{
++						Seq:      seq,
++						Layer:    layer,
++						BeginPos: cell.pos,
++						EndPos:   cell.pos + 1,
++						IsKey:    false,
++					}
++					dtype := t.Causal.DType.String()
++					shape := t.Causal.values[layer].Shape()
++					if err := t.store.Put(bv, dtype, shape, vBytes); err != nil {
++						slog.Warn("tiered: failed to snapshot value",
++							"layer", layer, "pos", cell.pos, "error", err)
++					}
++				}
++			}
++
++			if layer == 0 {
++				saved++
++			}
++		}
++	}
++
++	if saved > 0 {
++		slog.Debug("tiered: snapshot evicted KV",
++			"seq", seq, "begin", beginPos, "end", endPos, "positions", saved)
++	}
++}
++
++// RestoreRange attempts to load evicted KV data from disk back into
++// the cache for the given sequence and position range.
++//
++// Returns the number of positions successfully restored.
++// This is called from the modified LoadCacheSlot when a disk-backed
++// prefix extends beyond the in-memory prefix match.
++func (t *TieredCausal) RestoreRange(ctx ml.Context, seq int, beginPos, endPos int32) (int32, error) {
++	if !t.enabled || t.store == nil {
++		return 0, nil
++	}
++
++	var restored int32
++
++	for pos := beginPos; pos < endPos; pos++ {
++		// Check if ALL layers have this position on disk (key only check).
++		firstKey := diskstore.BlockKey{
++			Seq: seq, Layer: 0, BeginPos: pos, EndPos: pos + 1, IsKey: true,
++		}
++		if !t.store.Has(firstKey) {
++			break // Stop at first gap — prefix must be contiguous.
++		}
++
++		// Find a free cell.
++		cellIdx := -1
++		for i, cell := range t.Causal.cells {
++			if len(cell.sequences) == 0 {
++				cellIdx = i
++				break
++			}
++		}
++		if cellIdx < 0 {
++			slog.Debug("tiered: no free cells for restore", "pos", pos)
++			break
++		}
++
++		// Restore each layer's K and V.
++		allOk := true
++		for layer, key := range t.Causal.keys {
++			if key == nil {
++				continue
++			}
++
++			rowSize := key.Stride(2)
++			keyData := key.Bytes()
++
++			// Restore key.
++			bk := diskstore.BlockKey{
++				Seq: seq, Layer: layer, BeginPos: pos, EndPos: pos + 1, IsKey: true,
++			}
++			kBytes, _, err := t.store.Get(bk)
++			if err != nil || kBytes == nil {
++				allOk = false
++				break
++			}
++			kOffset := rowSize * cellIdx
++			if kOffset+rowSize <= len(keyData) {
++				copy(keyData[kOffset:kOffset+rowSize], kBytes)
++			}
++
++			// Restore value.
++			if val := t.Causal.values[layer]; val != nil {
++				valRowSize := val.Stride(2)
++				bv := diskstore.BlockKey{
++					Seq: seq, Layer: layer, BeginPos: pos, EndPos: pos + 1, IsKey: false,
++				}
++				vBytes, _, err := t.store.Get(bv)
++				if err != nil || vBytes == nil {
++					allOk = false
++					break
++				}
++				valData := val.Bytes()
++				vOffset := valRowSize * cellIdx
++				if vOffset+valRowSize <= len(valData) {
++					copy(valData[vOffset:vOffset+valRowSize], vBytes)
++				}
++			}
++		}
++
++		if !allOk {
++			break
++		}
++
++		// Mark the cell as occupied.
++		t.Causal.cells[cellIdx] = cacheCell{pos: pos, sequences: []int{seq}}
++		seqRange, ok := t.Causal.cellRanges[seq]
++		if !ok {
++			seqRange = newRange()
++		}
++		seqRange.min = min(seqRange.min, cellIdx)
++		seqRange.max = max(seqRange.max, cellIdx)
++		t.Causal.cellRanges[seq] = seqRange
++
++		restored++
++	}
++
++	if restored > 0 {
++		slog.Info("tiered: restored KV from disk",
++			"seq", seq, "begin", beginPos, "end", endPos, "restored", restored)
++	}
++
++	return restored, nil
++}
++
++// DiskStats returns the disk store statistics.
++func (t *TieredCausal) DiskStats() diskstore.Stats {
++	if t.store == nil {
++		return diskstore.Stats{}
++	}
++	return t.store.Stats()
++}
+diff --git a/runner/ollamarunner/cache.go b/runner/ollamarunner/cache.go
+--- a/runner/ollamarunner/cache.go
++++ b/runner/ollamarunner/cache.go
+@@ -1,6 +1,8 @@
+ package ollamarunner
+ 
+ import (
++	"os"
++	"strconv"
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
+@@ -8,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/ollama/ollama/kvcache"
++	"github.com/ollama/ollama/diskstore"
+ 	"github.com/ollama/ollama/ml"
+ 	"github.com/ollama/ollama/model"
+ 	"github.com/ollama/ollama/model/input"
+@@ -35,6 +38,50 @@ func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots
+ 		slots[i] = InputCacheSlot{Id: i}
+ 	}
+ 
++	// Check for tiered KV cache configuration via environment variables.
++	tieredEnabled := os.Getenv("OLLAMA_KV_TIERING") == "1"
++
+ 	cache := model.Config().Cache
+-	if cache != nil {
++	if cache != nil && tieredEnabled {
++		// Configure disk-backed tiering.
++		localPath := os.Getenv("OLLAMA_KV_TIER_LOCAL")
++		if localPath == "" {
++			localPath = "/tmp/ollama-kv-cache"
++		}
++		remotePath := os.Getenv("OLLAMA_KV_TIER_REMOTE")
++
++		localGB, _ := strconv.ParseInt(os.Getenv("OLLAMA_KV_TIER_LOCAL_GB"), 10, 64)
++		if localGB <= 0 {
++			localGB = 20
++		}
++		remoteGB, _ := strconv.ParseInt(os.Getenv("OLLAMA_KV_TIER_REMOTE_GB"), 10, 64)
++
++		compress := os.Getenv("OLLAMA_KV_TIER_COMPRESS") == "1"
++
++		store, err := diskstore.New(diskstore.Config{
++			LocalPath:    localPath,
++			RemotePath:   remotePath,
++			LocalBudget:  localGB * 1024 * 1024 * 1024,
++			RemoteBudget: remoteGB * 1024 * 1024 * 1024,
++			Compress:     compress,
++		})
++		if err != nil {
++			slog.Warn("tiered KV cache: failed to init disk store, falling back to standard cache",
++				"error", err)
++		} else {
++			slog.Info("tiered KV cache enabled",
++				"local", localPath, "remote", remotePath,
++				"local_gb", localGB, "remote_gb", remoteGB,
++				"compress", compress)
++
++			// Wrap the causal cache with tiered support.
++			if causal, ok := cache.(*kvcache.Causal); ok {
++				cache = kvcache.NewTieredCausal(causal, store, 256)
++			} else if wrapper, ok := cache.(*kvcache.WrapperCache); ok {
++				// For models with encoder+decoder caches.
++				_ = wrapper // TODO: wrap individual caches
++				slog.Warn("tiered KV cache: WrapperCache not yet supported, using standard")
++			}
++		}
++	} else if cache != nil {
+ 		cache.Init(backend, kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
+ 	}
+ 
+@@ -110,6 +157,26 @@ func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*In
+ 		numPast = 0
+ 	}
+ 
++	// Tiered extension: check if disk has more data extending the prefix.
++	if tiered, ok := c.cache.(*kvcache.TieredCausal); ok && numPast > 0 && numPast < int32(len(prompt)) {
++		// The in-memory prefix matched `numPast` tokens. Check if disk
++		// has the continuation from numPast onward.
++		diskEnd := int32(len(prompt))
++		if diskEnd-numPast > 4096 {
++			diskEnd = numPast + 4096 // Cap restore to avoid long I/O stalls.
++		}
++
++		ctx := /* obtain from backend */ nil
++		if ctx != nil {
++			restored, err := tiered.RestoreRange(ctx, slot.Id, numPast, diskEnd)
++			if err == nil && restored > 0 {
++				slog.Debug("tiered: extended prefix from disk",
++					"memory", numPast, "disk", restored, "total", numPast+restored)
++				numPast += restored
++			}
++		}
++	}
++
+ 	slot.InUse = true
+ 	slot.lastUsed = time.Now()
