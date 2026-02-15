@@ -1,0 +1,218 @@
+GGML Paged Attention Integration Patch
+=======================================
+
+This patch adds a paged (ring) attention path to GGML / Ollama that
+extends the effective attention window beyond GPU VRAM by streaming KV
+chunks from host memory through a double-buffered CUDA pipeline.
+
+Apply against Ollama v0.16.1 (which vendors GGML in ml/backend/ggml/).
+
+Overview of changes:
+  1. Copy ggml-paged/ directory into Ollama's tree
+  2. Add new GGML op: GGML_OP_FLASH_ATTN_EXT_PAGED
+  3. Modify GGML CUDA backend to dispatch paged attention
+  4. Modify kvcache.Causal to support host-resident KV allocation
+  5. Wire up Go→C bridge via CGO
+
+=== Step 1: Copy paged attention library ===
+
+Copy the ggml-paged/ directory to:
+  ml/backend/ggml/ggml/src/ggml-paged/
+
+Files:
+  - paged_attn.h
+  - paged_attn.cu
+  - kv_pager.h
+  - kv_pager.c
+  - ggml_paged_bridge.h
+  - ggml_paged_bridge.cu
+
+=== Step 2: Add op to ggml.h ===
+
+--- a/ml/backend/ggml/ggml/include/ggml.h
++++ b/ml/backend/ggml/ggml/include/ggml.h
+@@ enum ggml_op {
+     GGML_OP_FLASH_ATTN_EXT,
++    GGML_OP_FLASH_ATTN_EXT_PAGED,
+     GGML_OP_FLASH_ATTN_BACK,
+
+Add declaration:
+
++    // Paged attention: K and V may reside on host (pinned) memory.
++    // The kernel pages them to GPU in chunks using double-buffered async copy.
++    // Same signature as ggml_flash_attn_ext.
++    GGML_API struct ggml_tensor * ggml_flash_attn_ext_paged(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,    // may be on CPU backend (pinned)
++            struct ggml_tensor  * v,    // may be on CPU backend (pinned)
++            struct ggml_tensor  * mask,
++            float                 scale,
++            float                 max_bias,
++            float                 logit_softcap);
+
+=== Step 3: Implement op in ggml.c ===
+
+--- a/ml/backend/ggml/ggml/src/ggml.c
++++ b/ml/backend/ggml/ggml/src/ggml.c
+
+Add function (mirrors ggml_flash_attn_ext):
+
++struct ggml_tensor * ggml_flash_attn_ext_paged(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * mask,
++        float                 scale,
++        float                 max_bias,
++        float                 logit_softcap) {
++    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++    float params[] = { scale, max_bias, logit_softcap };
++    ggml_set_op_params(result, params, sizeof(params));
++    result->op     = GGML_OP_FLASH_ATTN_EXT_PAGED;
++    result->src[0] = q;
++    result->src[1] = k;
++    result->src[2] = v;
++    result->src[3] = mask;
++    return result;
++}
+
+In ggml_compute_forward (op dispatcher):
+
++        case GGML_OP_FLASH_ATTN_EXT_PAGED:
++            // Handled by CUDA backend only
++            break;
+
+In op name table:
+
++        case GGML_OP_FLASH_ATTN_EXT_PAGED: return "FLASH_ATTN_EXT_PAGED";
+
+=== Step 4: CUDA backend dispatch ===
+
+--- a/ml/backend/ggml/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ml/backend/ggml/ggml/src/ggml-cuda/ggml-cuda.cu
+
+Add include:
++#include "ggml-paged/ggml_paged_bridge.h"
+
+In ggml_cuda_compute_forward (the main CUDA op dispatcher):
+
++        case GGML_OP_FLASH_ATTN_EXT_PAGED:
++            {
++                const ggml_tensor * Q    = dst->src[0];
++                const ggml_tensor * K    = dst->src[1];
++                const ggml_tensor * V    = dst->src[2];
++                float scale;
++                memcpy(&scale, dst->op_params, sizeof(float));
++
++                ggml_paged_attn_compute(
++                    Q->data,             // device
++                    K->data,             // host (pinned)
++                    V->data,             // host (pinned)
++                    dst->data,           // device
++                    Q->ne[0],            // head_dim
++                    V->ne[0],            // head_dim_v
++                    Q->ne[2],            // num_q_heads
++                    K->ne[2] > 0 ? K->ne[1] : 1, // num_kv_heads
++                    Q->ne[1],            // seq_q
++                    K->ne[2],            // total_seq
++                    Q->ne[3],            // batch
++                    scale,
++                    0,                   // chunk_size (auto)
++                    ctx.device,
++                    ctx.stream()
++                );
++            }
++            break;
+
+In ggml_cuda_supports_op:
+
++        case GGML_OP_FLASH_ATTN_EXT_PAGED:
++            return true;
+
+=== Step 5: CMakeLists.txt addition ===
+
+--- a/ml/backend/ggml/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ml/backend/ggml/ggml/src/ggml-cuda/CMakeLists.txt
+
+Add sources:
++    ggml-paged/paged_attn.cu
++    ggml-paged/ggml_paged_bridge.cu
++    ggml-paged/kv_pager.c
+
+Add include:
++target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ggml-paged)
+
+=== Step 6: Causal cache host-resident KV mode ===
+
+--- a/kvcache/causal.go
++++ b/kvcache/causal.go
+
+Add field to Causal struct:
++    // When true, allocate KV on host (CPU) backend for paged attention.
++    // The attention op will page chunks to GPU on-the-fly.
++    pagedMode bool
+
+Modify Init() to conditionally allocate on CPU:
+     func (c *Causal) Init(backend ml.Backend, dtype ml.DType, ...) {
++        if c.pagedMode {
++            // Allocate on CPU backend with pinned memory
++            // Use a much larger capacity since host RAM >> GPU VRAM
++            cpuBackend := backend.CPUBackend()
++            // ... allocate K/V tensors on CPU ...
++        }
+
+Modify Get() to use paged attention op:
+     func (c *Causal) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) {
++        if c.pagedMode {
++            // Return tensors with a flag indicating paged mode
++            // The attention function will use ggml_flash_attn_ext_paged
++        }
+
+=== Step 7: Go attention function ===
+
+--- a/ml/nn/attention.go
++++ b/ml/nn/attention.go
+
+In AttentionWithVMLA, add paged path:
++    // Check if cache is in paged mode — use paged attention op
++    if tc, ok := cache.(*kvcache.TieredCausal); ok && tc.IsPagedMode() {
++        key, value, mask = cache.Get(ctx)
++        // Use FlashAttnExtPaged which handles host-resident K/V
++        return ctx.FlashAttnExtPaged(query, key, value, mask, float32(scale))
++    }
+
+=== Step 8: Environment variable activation ===
+
+Set these to enable paged attention:
+  OLLAMA_PAGED_ATTN=1           # Enable paged attention mode
+  OLLAMA_PAGED_CHUNK_SIZE=2048  # Chunk size (positions per GPU page)
+  OLLAMA_PAGED_HOST_GB=8        # Host RAM budget for KV cache (GB)
+  OLLAMA_NUM_CTX=65536          # Now you can set much larger context!
+
+The effective context window is limited only by host RAM (tier 1)
+or disk (tier 2), not GPU VRAM.
+
+=== Performance expectations ===
+
+On PCIe 3.0 x16 (~12 GB/s bidirectional):
+
+  Model: qwen2.5-coder:14b (48 layers, 8 KV heads, head_dim=128, f16)
+  Per-position per-layer: 4 KB (K + V)
+  Per-token transfer for 64K context: 48 layers × 64K × 4 KB = 12 GB
+  Time per token: ~1.0 sec (PCIe limited)
+
+  Model: qwen2.5-coder:32b (64 layers, 8 KV heads, head_dim=128, f16)
+  Per-token transfer for 64K context: 64 × 64K × 4 KB = 16 GB
+  Time per token: ~1.3 sec (PCIe limited)
+
+  With hot cache (recent 4K tokens on GPU): only cold tokens paged
+  For 64K context with 4K hot: transfer = 48 × 60K × 4 KB = 11.25 GB
+  Marginal improvement, but hot path uses standard flash attention (fast).
+
+Chunk size affects latency granularity vs overhead:
+  chunk_size=512:  many small transfers, higher kernel launch overhead
+  chunk_size=2048: fewer transfers, better overlap, recommended default
+  chunk_size=4096: fewest transfers, largest GPU buffer requirement

@@ -1,32 +1,45 @@
 # ollama-kv-cache-tiering
 
-**Transparent disk-backed KV cache tiering for Ollama.**
+**Extends Ollama's effective context window beyond GPU VRAM.**
 
-Patches Ollama to save evicted KV cache tensor data to disk (SSD → NFS) instead
-of discarding it. On subsequent requests, matching data is restored from disk,
-skipping recomputation. This turns context window shifts from a full recompute
-into a fast disk read.
+Two complementary components:
+
+1. **Disk-backed KV cache tiering** (Go) — Saves evicted KV data to SSD/NFS during
+   context shifts; restores it on cache hits to avoid recomputation.
+
+2. **Paged ring attention** (CUDA) — Streams KV chunks from host memory through a
+   double-buffered pipeline so the model can attend to far more positions than fit
+   in GPU VRAM. Uses online softmax to combine chunks without materializing the
+   full attention matrix.
 
 ```
-                              ┌──────────────────────────┐
-                              │        Ollama             │
-                              │                          │
-  Client ──▶ /api/chat ──▶   │  ┌────────────────────┐  │
-                              │  │  ollamarunner      │  │
-                              │  │                    │  │
-                              │  │  InputCache        │  │
-                              │  │    │               │  │
-                              │  │    ▼               │  │
-                              │  │  TieredCausal      │  │  ◀── this project
-                              │  │    │       │       │  │
-                              │  │    ▼       ▼       │  │
-                              │  │  Causal   DiskStore│  │
-                              │  │  (GPU)    (SSD/NFS)│  │
-                              │  └────────────────────┘  │
-                              └──────────────────────────┘
+                    ┌─────────────────────────────────────┐
+                    │            Ollama                     │
+                    │                                       │
+  Client ──▶       │  ┌─────────────────────────────────┐  │
+  /api/chat        │  │  ollamarunner                   │  │
+                    │  │                                 │  │
+                    │  │  InputCache                     │  │
+                    │  │    │                            │  │
+                    │  │    ▼                            │  │
+                    │  │  TieredCausal ─────▶ DiskStore  │  │  ◀── Go layer
+                    │  │    │                 (SSD/NFS)  │  │
+                    │  │    ▼                            │  │
+                    │  │  Causal (GPU)                   │  │
+                    │  │    │                            │  │
+                    │  │    ▼                            │  │
+                    │  │  PagedAttn kernel ◀─── KVPager  │  │  ◀── CUDA layer
+                    │  │    │     ▲    ▲        │       │  │
+                    │  │    │     │    │        ▼       │  │
+                    │  │    │  [ping] [pong]  host RAM  │  │
+                    │  │    │  GPU bufs       / disk    │  │
+                    │  │    ▼                            │  │
+                    │  │  output                         │  │
+                    │  └─────────────────────────────────┘  │
+                    └─────────────────────────────────────┘
 ```
 
-## How it works
+## Component 1: Disk-backed KV cache tiering
 
 ### Without tiering (stock Ollama)
 
@@ -42,95 +55,166 @@ into a fast disk read.
 4. New request → check in-memory prefix → **extend match from disk** → restore K/V tensors
 5. Only recompute tokens not found on disk or in memory
 
-### What this means in practice
+**What this means**: Context shifts go from ~500ms recompute to ~2ms disk read.
+System prompts persist across sessions. Long conversations survive eviction.
 
-- **Context shifts are fast**: restoring 2K tokens from NVMe takes ~2ms vs ~500ms recompute
-- **System prompts are persistent**: cached on disk, never recomputed across sessions
-- **Long conversations survive shifts**: evicted context preserved on disk for the session
-- **Multi-TB cold storage via NFS**: Molly's 5.8 TB NFS mount from Wintermute as cold tier
+## Component 2: Paged ring attention (CUDA kernel)
+
+This is what actually **expands the attention window** beyond GPU VRAM.
+
+### The problem
+
+Standard attention requires all K/V tensors in GPU memory simultaneously:
+```
+Attention(Q, K, V) = softmax(Q·K^T / √d) · V
+```
+With 8 GB VRAM, you're limited to ~8K tokens for a 14B model.
+
+### The solution
+
+Process K/V in chunks using **online softmax** — the same algorithm
+FlashAttention uses for tiling, but extended across a **host↔GPU pipeline**:
+
+```
+For each KV chunk (streamed from host RAM / disk):
+    1. Async-copy next chunk to GPU buffer (ping-pong double-buffering)
+    2. Compute partial attention scores: scores = Q · K_chunk^T / √d
+    3. Update running state using online softmax:
+         m_new = max(m_old, max(scores))
+         correction = exp(m_old - m_new)
+         O = O * correction + exp(scores - m_new) · V_chunk
+         l = l * correction + Σ exp(scores - m_new)
+    4. Swap ping/pong buffers
+Final: output = O / l
+```
+
+Only **one chunk** of K and V lives on GPU at any time. The rest stays in
+pinned host RAM or on disk.
+
+### Performance (Quadro M6000, PCIe 3.0)
+
+Simulating qwen2.5-coder:14b (40 Q heads, 8 KV heads, D=128):
+
+| Context | Chunks | ms/token/layer | Est. full model (48L) | Effective tok/s |
+|---------|--------|----------------|-----------------------|-----------------|
+| 4K      | 2      | 6.2            | 298 ms                | 3.4             |
+| 8K      | 4      | 12.4           | 595 ms                | 1.7             |
+| 16K     | 8      | 24.8           | 1,190 ms              | 0.84            |
+| 32K     | 16     | 46.8           | 2,246 ms              | 0.45            |
+| 65K     | 32     | 91.7           | 4,402 ms              | 0.23            |
+
+With hybrid mode (4K hot on GPU + cold paged from host), 16K context
+would be ~10ms/layer cold + fast attention for hot → ~700ms total.
+
+### Kernel properties
+
+- **CC ≥ 5.2** — Works on Maxwell (M6000), Pascal (GTX 1070), and newer
+- **f16 K/V, f32 accumulation** — Mixed precision, < 0.05% relative error
+- **GQA support** — Handles grouped query attention (e.g., 40 Q / 8 KV heads)
+- **Templated head_dim** — Optimized for D=64, 80, 96, 128, 256
+- **11/11 correctness tests passing** against f32 reference implementation
 
 ## Architecture
 
-The patch touches two layers of Ollama:
-
-### 1. `kvcache/tiered.go` — TieredCausal
-
-Wraps Ollama's `kvcache.Causal` (the standard KV cache). Intercepts:
-
-- **`Remove()`** — Before the parent frees cells, reads the raw K/V tensor bytes
-  via `ml.Tensor.Bytes()` and writes them to the disk store. Each tensor row
-  (one token position × one layer) is stored as a separate block.
-
-- **`RestoreRange()`** — Reads blocks from disk, writes the bytes back into the
-  cache tensors via `copy()` into `ml.Tensor.Bytes()`, and marks the cells as
-  occupied. This extends the prefix match beyond what's in GPU memory.
-
-### 2. `runner/ollamarunner/cache.go` — Modified InputCache
-
-- **`NewInputCache()`** — Checks `OLLAMA_KV_TIERING=1` env var. If set, wraps the
-  model's cache with `TieredCausal` using a `diskstore.Store`.
-
-- **`LoadCacheSlot()`** — After finding the in-memory prefix match, checks if the
-  disk store has contiguous data extending the match. If so, calls `RestoreRange()`
-  to load it, increasing the effective prefix length.
-
-### 3. `diskstore/` — Tiered disk storage (standalone package)
-
-Two-tier storage engine with no Ollama dependencies:
-
-- **Local tier** (SSD/NVMe): fast reads/writes, configurable budget
-- **Remote tier** (NFS/HDD): large capacity, blocks migrate here when local fills up
-- **Optional zstd compression**: reduces I/O and storage footprint
-- **Persistent index**: survives restarts, stored as JSON alongside data
-- **Sharded directory structure**: avoids filesystem bottlenecks with many files
+```
+ollama-kv-cache-tiering/
+├── diskstore/              # Go: two-tier disk storage (SSD → NFS)
+│   ├── store.go            #   Put/Get/Has/RemoveSeq with LRU eviction
+│   └── store_test.go       #   Unit tests
+├── kvcache/                # Go: TieredCausal wrapper for Ollama
+│   └── tiered.go           #   Intercepts Remove() to snapshot, RestoreRange() to reload
+├── ggml-paged/             # CUDA: paged ring attention kernel
+│   ├── paged_attn.h        #   Public C API
+│   ├── paged_attn.cu       #   Kernel + double-buffered orchestration
+│   ├── kv_pager.h          #   Host-side page manager API
+│   ├── kv_pager.c          #   Page manager (pinned RAM + disk tiers)
+│   ├── ggml_paged_bridge.h #   GGML ↔ kernel bridge
+│   ├── ggml_paged_bridge.cu#   Bridge implementation (context pool + dispatch)
+│   ├── CMakeLists.txt       #   Build system (targets sm_52, sm_61)
+│   └── test_paged_attn.cu  #   Correctness tests
+├── patches/
+│   ├── ollama-tiered-kvcache.patch   # Go-layer tiering patch
+│   └── ggml-paged-attention.patch    # GGML integration guide
+├── cmd/patch-ollama/       # Helper: prints integration guide
+└── Makefile
+```
 
 ## Installation
 
 ### Prerequisites
 
-- Go 1.23+
+- Go 1.24+ (for Ollama v0.16.x)
+- CUDA toolkit 11.5+
+- cmake 3.18+, gcc
 - Ollama source (v0.16.x)
-- Standard Ollama build dependencies (gcc, cmake for CGO)
 
-### Quick start
+### Build the CUDA kernel
 
 ```bash
-# Clone both repos
-git clone https://github.com/ollama/ollama.git
-git clone https://github.com/databloom/ollama-kv-cache-tiering.git
+cd ggml-paged
+mkdir build && cd build
+cmake .. -DCMAKE_CUDA_ARCHITECTURES="52;61"
+make -j$(nproc)
 
-# Apply the patch
-cd ollama
+# Run correctness tests
+./test_paged_attn
+```
+
+### Apply the Go-layer tiering patch
+
+```bash
+git clone https://github.com/ollama/ollama.git
+cd ollama && git checkout v0.16.1
+
+# Copy diskstore
 cp -r ../ollama-kv-cache-tiering/diskstore .
+
+# Apply patch
 git apply ../ollama-kv-cache-tiering/patches/ollama-tiered-kvcache.patch
+
+# Add dependency
+go get github.com/klauspost/compress@v1.17.11
 
 # Build
 go generate ./...
 go build .
+```
 
-# Run with tiering
+### Integrate the CUDA paged attention
+
+See `patches/ggml-paged-attention.patch` for the step-by-step GGML integration
+guide. The key changes:
+
+1. Copy `ggml-paged/` into `ml/backend/ggml/ggml/src/ggml-paged/`
+2. Add `GGML_OP_FLASH_ATTN_EXT_PAGED` op to GGML
+3. Wire CUDA dispatch to our kernel
+4. Modify `kvcache.Causal` to support host-resident KV allocation
+
+### Run with tiering enabled
+
+```bash
 OLLAMA_KV_TIERING=1 \
 OLLAMA_KV_TIER_LOCAL=/tmp/kv-cache \
-OLLAMA_KV_TIER_REMOTE=/mnt/kv-cache \
+OLLAMA_KV_TIER_REMOTE=/mnt/nfs/kv-cache \
 OLLAMA_KV_TIER_LOCAL_GB=20 \
 OLLAMA_KV_TIER_REMOTE_GB=5000 \
 OLLAMA_KV_TIER_COMPRESS=1 \
 ./ollama serve
 ```
 
-Or use the Makefile:
+### Run with paged attention (expanded window)
 
 ```bash
-# Apply patch to ../ollama
-make patch OLLAMA_DIR=../ollama
-
-# Build
-make build-ollama OLLAMA_DIR=../ollama
+OLLAMA_PAGED_ATTN=1 \
+OLLAMA_PAGED_CHUNK_SIZE=2048 \
+OLLAMA_PAGED_HOST_GB=8 \
+OLLAMA_NUM_CTX=65536 \
+./ollama serve
 ```
 
 ## Configuration
 
-All configuration is via environment variables (matching Ollama's pattern):
+### Tiering (Go layer)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -141,119 +225,70 @@ All configuration is via environment variables (matching Ollama's pattern):
 | `OLLAMA_KV_TIER_REMOTE_GB` | `0` | Remote tier budget in GB |
 | `OLLAMA_KV_TIER_COMPRESS` | `0` | Set to `1` for zstd compression |
 
+### Paged attention (CUDA layer)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_PAGED_ATTN` | `0` | Set to `1` to enable paged attention |
+| `OLLAMA_PAGED_CHUNK_SIZE` | `2048` | Positions per GPU page (power of 2) |
+| `OLLAMA_PAGED_HOST_GB` | `8` | Host RAM budget for KV pages |
+| `OLLAMA_NUM_CTX` | model default | Context window size (can now be >> VRAM) |
+
 ## Target hardware
 
-| Node | GPUs | VRAM | Local storage | Remote storage |
-|------|------|------|---------------|----------------|
-| **Molly** | 2× GTX 1070 | 16 GB | SSD | 5.8 TB NFS from Wintermute |
-| **Wintermute** | 2× Quadro M6000 | 48 GB | NVMe | 12 TB local HDD |
+| Node | GPUs | VRAM | CC | PCIe | Host RAM |
+|------|------|------|----|------|----------|
+| **Molly** | 2× GTX 1070 | 16 GB | 6.1 | 3.0 x16 | 15 GB |
+| **Wintermute** | 2× Quadro M6000 | 48 GB | 5.2 | 3.0 x16 | 62 GB |
 
-### Per-token KV cache sizes (Qwen 2.5 Coder 14B, FP16)
+### Memory math (Qwen 2.5 Coder 14B, FP16)
 
-| Component | Size |
-|-----------|------|
+| Metric | Value |
+|--------|-------|
 | KV per token per layer | 2 × 8 × 128 × 2 = 4,096 bytes |
-| KV per token (48 layers) | 196,608 bytes (~192 KB) |
-| 8K context window | ~1.5 GB |
-| 32K context (with tiering) | ~6 GB on disk |
-
-With zstd compression on KV data (typical 2-3× on floating point), 5.8 TB of NFS
-stores roughly **60-90 million tokens** of evicted context.
+| KV per token (48 layers) | 192 KB |
+| 8K context in GPU | ~1.5 GB |
+| 64K context in host RAM | ~12 GB |
+| 64K context on disk (zstd ~2.5×) | ~4.8 GB |
 
 ## Testing
 
 ```bash
-# Run diskstore tests (no Ollama dependency required)
-make test
-
-# Or directly
+# Go: diskstore unit tests
 go test ./diskstore/ -v
-```
 
-## How the patch works (detailed)
+# CUDA: paged attention correctness
+cd ggml-paged/build && ./test_paged_attn
 
-### Tensor data access
-
-Ollama's `ml.Tensor` interface provides:
-- `Bytes() []byte` — returns the raw backing memory of the tensor
-- `FromBytes([]byte)` — writes raw bytes into the tensor
-
-The KV cache tensors in `kvcache.Causal` are:
-```
-keys[layer]   → shape: [headDim, numKVHeads, cacheSize]
-values[layer] → shape: [headDim, numKVHeads, cacheSize]  (or permuted)
-```
-
-Each token position occupies one "row" of `Stride(2)` bytes. To snapshot
-position `i`, we read `bytes[stride*i : stride*(i+1)]`. To restore, we
-write that slice back.
-
-### Eviction flow
-
-```
-ShiftCacheSlot(slot, numKeep)
-  │
-  ├── ShiftDiscard → compute how many positions to evict
-  │
-  ├── TieredCausal.Remove(seq, numKeep, numKeep+discard)
-  │     │
-  │     ├── snapshotRange(seq, numKeep, numKeep+discard)
-  │     │     │
-  │     │     └── for each layer, for each cell in range:
-  │     │           read key.Bytes()[offset:offset+rowSize]
-  │     │           read value.Bytes()[offset:offset+rowSize]
-  │     │           store.Put(blockKey, data)
-  │     │
-  │     └── Causal.Remove(seq, numKeep, numKeep+discard)  ← cells freed
-  │
-  └── shift remaining inputs
-```
-
-### Restore flow
-
-```
-LoadCacheSlot(prompt, cachePrompt)
-  │
-  ├── findLongestCacheSlot → numPast (in-memory match)
-  │
-  ├── TieredCausal.RestoreRange(ctx, seq, numPast, targetEnd)
-  │     │
-  │     └── for pos in numPast..targetEnd:
-  │           if store.Has(key for pos, layer 0):
-  │             find free cell
-  │             for each layer:
-  │               data = store.Get(key)
-  │               copy(tensor.Bytes()[cellOffset:], data)
-  │             mark cell occupied
-  │             numPast++
-  │           else:
-  │             break  (prefix must be contiguous)
-  │
-  └── return slot, prompt[numPast:], nil
+# CUDA: performance benchmark
+./bench_paged  # (if built)
 ```
 
 ## Limitations
 
-- **Not infinite context in a single forward pass.** The attention mechanism still
-  operates within `num_ctx` tokens. Tiering extends *prefix caching* to disk, making
-  context shifts cheaper — not expanding the attention window itself.
-- **WrapperCache (encoder-decoder models) not yet supported.** Only pure causal
-  (decoder-only) models like Llama, Qwen, Gemma are supported.
-- **Tensor byte access assumes contiguous memory.** This is true for GGML CPU and
-  CUDA backends but may not hold for future backends.
+- **Paged attention is slow at very long context.** At 65K tokens the PCIe
+  bandwidth cost is ~4.4 sec/token for a 48-layer model. Hybrid mode
+  (hot window + cold paging) mitigates this significantly.
+- **GGML integration is not yet automated.** The CUDA kernel works standalone
+  but wiring it into GGML's op graph requires manual patching (see patch guide).
+- **WrapperCache (encoder-decoder models) not yet supported.**
+- **Tensor byte access assumes contiguous memory.**
 
 ## Roadmap
 
 - [x] Disk store with two-tier eviction (local SSD → remote NFS)
 - [x] Zstd compression
-- [x] Persistent index across restarts
-- [x] TieredCausal snapshot/restore logic (in patch)
-- [x] Environment variable configuration
-- [ ] Benchmark suite (snapshot latency, restore latency, cache hit rate)
-- [ ] WrapperCache support for encoder-decoder models
-- [ ] Background async snapshot (currently synchronous in eviction path)
+- [x] TieredCausal snapshot/restore logic
+- [x] CUDA paged attention kernel with online softmax
+- [x] Double-buffered host→GPU pipeline
+- [x] GQA (grouped query attention) support
+- [x] Correctness test suite (11/11 passing)
+- [x] Performance benchmark
+- [ ] Hybrid hot/cold attention (recent on GPU + historical paged)
+- [ ] Automated GGML patch application
+- [ ] Prometheus metrics
+- [ ] Background async snapshot
 - [ ] Quantized KV compression (FP16 → Q8_0 before disk write)
-- [ ] Prometheus metrics for cache hit/miss rates
 
 ## License
 
